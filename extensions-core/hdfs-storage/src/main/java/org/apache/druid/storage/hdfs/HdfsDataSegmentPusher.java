@@ -191,7 +191,7 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
           5
       );
 
-      emitMetrics(result.getSize(), System.currentTimeMillis() - startTime);
+      emitMetrics(format, result.getSize(), System.currentTimeMillis() - startTime);
 
       return result;
     }
@@ -202,14 +202,18 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
     }
   }
 
-  private void emitMetrics(long size, long duration)
+  private void emitMetrics(
+    CompressionUtils.Format format,
+    long size,
+    long duration
+  )
   {
     if (emitter == null) {
       return;
     }
 
     final ServiceMetricEvent.Builder metricBuilder = ServiceMetricEvent.builder();
-    metricBuilder.setDimension("format", compressionFormat);
+    metricBuilder.setDimension("format", format);
     emitter.emit(metricBuilder.setMetric("hdfs/push/size", size));
     emitter.emit(metricBuilder.setMetric("hdfs/push/duration", duration));
   }
@@ -261,6 +265,7 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
       // Create parent if it does not exist, recreation is not an error.
       fs.mkdirs(outIndexPath.getParent());
       copyFilesWithChecks(fs, tmpPath, outIndexPath);
+      deleteSiblingRepresentations(fs, outIndexPath);
     }
     catch (IOException e) {
       log.error(e, "Failed to push segment[%s] to HDFS at location[%s]", segment.getId(), outIndexFilePath);
@@ -278,6 +283,43 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
     }
 
     return dataSegment;
+  }
+
+  private void deleteSiblingRepresentations(final FileSystem fs, final Path publishedPath) throws IOException
+  {
+    final String filename = publishedPath.getName();
+    final CompressionUtils.Format compressionFormat = CompressionUtils.Format.fromFileName(filename);
+    final String stem = compressionFormat == null
+                        ? filename
+                        : filename.substring(0, filename.length() - compressionFormat.getSuffix().length());
+
+    if (!isSegmentRepresentationName(stem)) {
+      return;
+    }
+
+    for (CompressionUtils.Format siblingFormat : new CompressionUtils.Format[]{
+        CompressionUtils.Format.ZIP,
+        CompressionUtils.Format.LZ4,
+        CompressionUtils.Format.NONE
+    }) {
+      final String siblingName = siblingFormat == CompressionUtils.Format.NONE
+                                 ? stem
+                                 : stem + siblingFormat.getSuffix();
+      final Path siblingPath = new Path(publishedPath.getParent(), siblingName);
+      if (!siblingPath.equals(publishedPath) && fs.exists(siblingPath)) {
+        final boolean isDirectory = fs.getFileStatus(siblingPath).isDirectory();
+        if (!fs.delete(siblingPath, isDirectory)) {
+          throw new IOException("Unable to remove stale segment representation");
+        }
+      }
+    }
+  }
+
+  private static boolean isSegmentRepresentationName(final String stem)
+  {
+    final String[] parts = stem.split("_");
+    return "index".equals(stem) ||
+           (parts.length >= 2 && parts.length <= 3 && parts[parts.length - 1].equals("index"));
   }
 
   private void copyFilesWithChecks(final FileSystem fs, final Path from, final Path to) throws IOException

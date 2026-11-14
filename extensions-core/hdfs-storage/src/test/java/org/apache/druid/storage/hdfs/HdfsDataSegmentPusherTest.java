@@ -36,6 +36,11 @@ import org.apache.druid.jackson.GranularityModule;
 import org.apache.druid.java.util.common.IAE;
 import org.apache.druid.java.util.common.Intervals;
 import org.apache.druid.java.util.common.StringUtils;
+import org.apache.druid.java.util.emitter.core.Emitter;
+import org.apache.druid.java.util.emitter.core.Event;
+import org.apache.druid.java.util.emitter.service.ServiceEmitter;
+import org.apache.druid.java.util.emitter.service.ServiceMetricEvent;
+import org.apache.druid.segment.IndexIO;
 import org.apache.druid.segment.loading.DeepStorageSegmentConfig;
 import org.apache.druid.testing.TemporaryFolderExtension;
 import org.apache.druid.timeline.DataSegment;
@@ -56,9 +61,11 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Objects;
 import java.util.regex.Pattern;
 
@@ -636,5 +643,270 @@ public class HdfsDataSegmentPusherTest
         "Temporary HDFS directory (UUID folder) should be cleaned up"
       );
     }
+  }
+
+  @Test
+  public void testPushV9ThenV10RemovesZipRepresentation() throws Exception
+  {
+    assertRepresentationTransition(
+      CompressionUtils.Format.ZIP,
+      IndexIO.V9_VERSION,
+      IndexIO.V10_VERSION
+    );
+  }
+
+  @Test
+  public void testPushV10ThenV9RemovesZipRepresentation() throws Exception
+  {
+    assertRepresentationTransition(
+      CompressionUtils.Format.ZIP,
+      IndexIO.V10_VERSION,
+      IndexIO.V9_VERSION
+    );
+  }
+
+  @Test
+  public void testPushV9ThenV10RemovesLz4Representation() throws Exception
+  {
+    assertRepresentationTransition(
+      CompressionUtils.Format.LZ4,
+      IndexIO.V9_VERSION,
+      IndexIO.V10_VERSION
+    );
+  }
+
+  @Test
+  public void testPushV10ThenV9RemovesLz4Representation() throws Exception
+  {
+    assertRepresentationTransition(
+      CompressionUtils.Format.LZ4,
+      IndexIO.V10_VERSION,
+      IndexIO.V9_VERSION
+    );
+  }
+
+  @Test
+  public void testV10PushEmitsNoneFormatMetricWhenZipIsConfigured() throws Exception
+  {
+    assertPushMetricFormat(
+      IndexIO.V10_VERSION,
+      CompressionUtils.Format.NONE
+    );
+  }
+
+  @Test
+  public void testV9PushEmitsConfiguredZipFormatMetric() throws Exception
+  {
+    assertPushMetricFormat(
+      IndexIO.V9_VERSION,
+      CompressionUtils.Format.ZIP
+    );
+  }
+
+  private void assertPushMetricFormat(
+    int segmentVersion,
+    CompressionUtils.Format expectedFormat
+  ) throws Exception
+  {
+    final List<ServiceMetricEvent> metricEvents = new ArrayList<>();
+
+    final ServiceEmitter serviceEmitter = createCapturingServiceEmitter(metricEvents);
+
+    final HdfsDataSegmentPusherConfig config = new HdfsDataSegmentPusherConfig();
+    config.setStorageDirectory(tempFolder.newFolder().getAbsolutePath());
+
+    final HdfsDataSegmentPusher pusher = new HdfsDataSegmentPusher(
+      config,
+      new Configuration(true),
+      serviceEmitter,
+      new DeepStorageSegmentConfig(null, CompressionUtils.Format.ZIP)
+    );
+
+    final DataSegment segment = DataSegment.builder(
+        SegmentId.of("foo", Intervals.of("2015/2016"), "0", 0)
+      )
+      .loadSpec(new HashMap<>())
+      .dimensions(new ArrayList<>())
+      .metrics(new ArrayList<>())
+      .shardSpec(new NumberedShardSpec(0, 0))
+      .binaryVersion(0)
+      .size(0)
+      .build();
+
+    pusher.push(createSegmentDirectory(segmentVersion), segment, false);
+
+    Assertions.assertEquals(2, metricEvents.size());
+
+    assertMetricFormat(
+      metricEvents,
+      "hdfs/push/size",
+      expectedFormat
+    );
+
+    assertMetricFormat(
+      metricEvents,
+      "hdfs/push/duration",
+      expectedFormat
+    );
+  }
+
+  private ServiceEmitter createCapturingServiceEmitter(List<ServiceMetricEvent> metricEvents)
+  {
+    final Emitter capturingEmitter = new Emitter()
+    {
+      @Override
+      public void start()
+      {
+      }
+
+      @Override
+      public void emit(Event event)
+      {
+        if (event instanceof ServiceMetricEvent) {
+          metricEvents.add((ServiceMetricEvent) event);
+        }
+      }
+
+      @Override
+      public void flush()
+      {
+      }
+
+      @Override
+      public void close()
+      {
+      }
+    };
+
+    return new ServiceEmitter(
+      "test",
+      "localhost",
+      capturingEmitter
+    );
+  }
+
+  private void assertMetricFormat(
+    List<ServiceMetricEvent> metricEvents,
+    String metricName,
+    CompressionUtils.Format expectedFormat
+  )
+  {
+    final ServiceMetricEvent metricEvent = metricEvents.stream()
+      .filter(event -> metricName.equals(event.getMetric()))
+      .findFirst()
+      .orElseThrow(() -> new AssertionError("Missing metric: " + metricName));
+
+    Assertions.assertEquals(
+      expectedFormat.toString(),
+      Objects.requireNonNull(metricEvent.getUserDims().get("format")).toString(),
+      "Incorrect format dimension for metric " + metricName
+    );
+  }
+
+  private void assertRepresentationTransition(
+    CompressionUtils.Format compressionFormat,
+    int firstVersion,
+    int secondVersion
+  ) throws Exception
+  {
+    final Configuration conf = new Configuration(true);
+
+    final HdfsDataSegmentPusherConfig config = new HdfsDataSegmentPusherConfig();
+    final File storageDirectory = tempFolder.newFolder();
+    config.setStorageDirectory(storageDirectory.getAbsolutePath());
+
+    final HdfsDataSegmentPusher pusher = new HdfsDataSegmentPusher(
+      config,
+      conf,
+      null,
+      new DeepStorageSegmentConfig(null, compressionFormat)
+    );
+
+    final DataSegment segment = DataSegment.builder(
+        SegmentId.of("foo", Intervals.of("2015/2016"), "0", 0)
+      )
+      .loadSpec(new HashMap<>())
+      .dimensions(new ArrayList<>())
+      .metrics(new ArrayList<>())
+      .shardSpec(new NumberedShardSpec(0, 0))
+      .binaryVersion(0)
+      .size(0)
+      .build();
+
+    final File firstSegmentDir = createSegmentDirectory(firstVersion);
+    final DataSegment firstPush = pusher.push(firstSegmentDir, segment, false);
+
+    final File segmentParent = new File(
+      storageDirectory,
+      pusher.getStorageDir(segment, false)
+    );
+
+    final File zipPath = new File(segmentParent, "0_index.zip");
+    final File lz4Path = new File(segmentParent, "0_index.lz4");
+    final File directoryPath = new File(segmentParent, "0_index");
+
+    final File firstRepresentation = firstVersion == IndexIO.V10_VERSION
+      ? directoryPath
+      : compressionFormat == CompressionUtils.Format.ZIP
+      ? zipPath
+      : lz4Path;
+
+    Assertions.assertTrue(
+      firstRepresentation.exists(),
+      "The first representation should exist after the initial push"
+    );
+
+    final File secondSegmentDir = createSegmentDirectory(secondVersion);
+    final DataSegment secondPush = pusher.push(secondSegmentDir, segment, false);
+
+    final File expectedRepresentation = secondVersion == IndexIO.V10_VERSION
+      ? directoryPath
+      : compressionFormat == CompressionUtils.Format.ZIP
+      ? zipPath
+      : lz4Path;
+
+    Assertions.assertTrue(
+      expectedRepresentation.exists(),
+      "The new representation should exist after the replacement push"
+    );
+
+    Assertions.assertFalse(
+      firstRepresentation.exists(),
+      "The previous representation should be removed after the replacement push"
+    );
+
+    Assertions.assertEquals(
+      secondVersion,
+      secondPush.getBinaryVersion()
+    );
+
+    Assertions.assertEquals(
+      secondVersion == IndexIO.V10_VERSION,
+      directoryPath.isDirectory()
+    );
+
+    Assertions.assertNotEquals(
+      Objects.requireNonNull(firstPush.getLoadSpec()).get("path"),
+      Objects.requireNonNull(secondPush.getLoadSpec()).get("path"),
+      "The load spec should point to the newly published representation"
+    );
+  }
+
+  private File createSegmentDirectory(int version) throws IOException
+  {
+    final File segmentDir = tempFolder.newFolder();
+
+    final File versionFile = new File(segmentDir, "version.bin");
+    Files.write(
+      ByteBuffer.allocate(Integer.BYTES).putInt(version).array(),
+      versionFile
+    );
+
+    Files.write(
+      new byte[]{0x1, 0x2, 0x3, 0x4},
+      new File(segmentDir, "index.smoosh")
+    );
+
+    return segmentDir;
   }
 }
